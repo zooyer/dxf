@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	bzGap  = 20
-	winGap = 10
+	bzGap   = 30 // 标注连接线容错(不超过则认为挨着门窗周围)，验证过: 20
+	winGap  = 20 // 窗户连接线容错(不超过则认为是同一个窗户)，验证过: 10
+	epsilon = 1  // 浮点数对比精度误差(误差不超过则认为相同)，验证过: 1
 )
 
 type Window struct {
@@ -31,11 +32,11 @@ type Window struct {
 }
 
 func (w Window) Width() float64 {
-	return math.Floor(w.Box.Max.X - w.Box.Min.X)
+	return w.Box.Max.X - w.Box.Min.X
 }
 
 func (w Window) Height() float64 {
-	return math.Floor(w.Box.Max.Y - w.Box.Min.Y)
+	return w.Box.Max.Y - w.Box.Min.Y
 }
 
 func (w Window) MaxWidth() float64 {
@@ -281,7 +282,9 @@ func renderBool(b bool) string {
 }
 
 func init() {
-	//os.Args = append(os.Args, "test/testdata/洞口图纸10.dxf")
+	if strings.HasPrefix(filepath.Base(os.Args[0]), "___go_build_") {
+		os.Args = append(os.Args, "cmd/testdata/洞口图纸10.dxf")
+	}
 
 	if len(os.Args) < 2 {
 		fmt.Println("请把PDF文件拖入该程序上执行！")
@@ -365,11 +368,19 @@ func main() {
 	}
 
 	// 4. 写入表头
+	const (
+		header    = "序号,楼号,宽度,高度,校验,测量宽度,测量高度,识别宽度,识别高度\n"
+		emptyLine = ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,"
+	)
 	var filename = strings.TrimSuffix(os.Args[1], filepath.Ext(os.Args[1])) + ".csv"
-	_ = os.WriteFile(filename, []byte("序号,楼号,宽度,高度,校验\n"), 0644)
+	_ = os.WriteFile(filename, []byte(header), 0644)
 	fmt.Println("写入文件:", filename)
 	fmt.Println()
 
+	var (
+		totalWin  int     // 总窗户数
+		totalArea float64 // 总窗户面积
+	)
 	// 5. 写入表格，打印输出
 	for i, form := range forms {
 		var (
@@ -378,7 +389,7 @@ func main() {
 		)
 
 		// 打印信息
-		fmt.Printf("[TKA4.%02d] | (%.2f, %.2f) - (%.2f, %.2f)         | %s\n",
+		fmt.Printf("[TKA4.%02d] | RECTANG %.2f,%.2f %.2f,%.2f | SC=%s\n",
 			i+1, box.Min.X, box.Min.Y, box.Max.X, box.Max.Y, renderBool(len(form.scs) == 1),
 		)
 		for j, sc := range form.scs {
@@ -395,21 +406,36 @@ func main() {
 
 		for j, w := range wins {
 			// 打印信息
-			fmt.Printf("    [窗户%d] | %.0f x %.0f | RECTANG %.0f,%.0f %.0f,%.0f\n",
-				j+1, w.Width(), w.Height(), w.Box.Min.X, w.Box.Min.Y, w.Box.Max.X, w.Box.Max.Y,
+			var width, height = w.Width(), w.Height()
+			fmt.Printf("    [窗户%d] | %.1f x %.1f | RECTANG %.2f,%.2f %.2f,%.2f\n",
+				j+1, width, height, w.Box.Min.X, w.Box.Min.Y, w.Box.Max.X, w.Box.Max.Y,
 			)
-			fmt.Println("      W:", w.Widths, renderBool(w.VerifyWidth(1)))
-			fmt.Println("      H:", w.Heights, renderBool(w.VerifyHeight(1)))
+			// 识别宽高
+			var verifyWidth, verifyHeight = w.VerifyWidth(epsilon), w.VerifyHeight(epsilon)
+			fmt.Println("       |-- [识别宽度]:", w.Widths, renderBool(verifyWidth))
+			fmt.Println("       |-- [识别高度]:", w.Heights, renderBool(verifyHeight))
+			// 最终选区
+			fmt.Printf("       |-- [最终范围]: RECTANG %.0f,%.0f %.0f,%.0f\n", w.Area.Min.X, w.Area.Min.Y, w.Area.Max.X, w.Area.Max.Y)
 
-			var valid = renderBool(w.VerifyWidth(1) && w.VerifyHeight(1))
+			// 统计信息
+			totalWin++
+			totalArea += width * height
 
-			var line = fmt.Sprintf(",,%.0f,%.0f,%s\n", w.MaxWidth(), w.MaxHeight(), valid)
+			var (
+				valid    = renderBool(verifyWidth && verifyHeight)
+				serial   string
+				building string
+			)
 
 			if j == 0 {
-				line = fmt.Sprintf("%s,%s,%.0f,%.0f,%s\n", form.Serial(), form.Building(), w.MaxWidth(), w.MaxHeight(), valid)
+				serial, building = form.Serial(), form.Building()
 			}
 
-			// fmt.Print(line)
+			var line = fmt.Sprintf("%s,%s,%.0f,%.0f,%s,%.0f,%.0f,%s,%s\n",
+				serial, building, w.MaxWidth(), w.MaxHeight(),
+				valid, width, height,
+				fmt.Sprint(w.Widths), fmt.Sprint(w.Heights),
+			)
 
 			if err = xos.AppendFile(filename, []byte(line), 0644); err != nil {
 				panic(err)
@@ -418,13 +444,19 @@ func main() {
 
 		// 填充空行，至少7行
 		for j := len(wins); j < 7; j++ {
-			var empty = ",,,,\n"
+			var line = emptyLine[:strings.Count(header, ",")] + "\n"
 
-			//fmt.Print(empty)
-
-			if err = xos.AppendFile(filename, []byte(empty), 0644); err != nil {
+			if err = xos.AppendFile(filename, []byte(line), 0644); err != nil {
 				panic(err)
 			}
 		}
+	}
+
+	// 写入统计信息
+	var stat = fmt.Sprintf("共%d楼号,共%d门窗,共%f面积%s\n",
+		len(forms), totalWin, totalArea, emptyLine[:strings.Count(header, ",")-2],
+	)
+	if err = xos.AppendFile(filename, []byte(stat), 0644); err != nil {
+		panic(err)
 	}
 }
