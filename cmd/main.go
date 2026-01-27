@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"os"
@@ -281,6 +282,34 @@ func renderBool(b bool) string {
 	return "❌"
 }
 
+func checkCSV(filename, header string) {
+	// 校验表格文件
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		fmt.Println("[表格检测] 打开文件失败:", err.Error())
+		return
+	}
+
+	var count = strings.Count(header, ",")
+	var lines [][2]int
+	for i, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+
+		if curr := strings.Count(line, ","); curr != count {
+			lines = append(lines, [2]int{i, curr})
+		}
+	}
+
+	if len(lines) > 0 {
+		fmt.Println("[表格检测] 表头分隔符数:", count, "检测到csv格式不正确，请检查！❌")
+		for _, line := range lines {
+			fmt.Println(fmt.Sprintf("  [LINE %d] 分隔符数量: %d", line[0]+1, line[1]))
+		}
+	}
+}
+
 func init() {
 	if strings.HasPrefix(filepath.Base(os.Args[0]), "___go_build_") {
 		os.Args = append(os.Args, "cmd/testdata/洞口图纸10.dxf")
@@ -376,6 +405,8 @@ func main() {
 	_ = os.WriteFile(filename, []byte(header), 0644)
 	fmt.Println("写入文件:", filename)
 	fmt.Println()
+	// 最后校验文件格式
+	defer checkCSV(filename, header)
 
 	// 统计信息
 	var (
@@ -463,17 +494,17 @@ func main() {
 	}
 
 	// 写入统计信息
-	var stat = fmt.Sprintf("共%d楼号,共%d门窗,共%f面积%s\n",
-		len(forms), totalWin, totalArea, emptyLine[:strings.Count(header, ",")-2],
-	)
-	if err = xos.AppendFile(filename, []byte(stat), 0644); err != nil {
+	var buf bytes.Buffer
+	buf.WriteString("统计信息,总楼号数,总门窗数,总面积,A4页数,误差数,文件名,,\n")
+	buf.WriteString(fmt.Sprintf(",%d,%d,%.6f,%d,%d,%s,,\n", attrCount, totalWin, totalArea/1000000, len(forms), diffCount, filepath.Base(os.Args[1])))
+	if err = xos.AppendFile(filename, buf.Bytes(), 0644); err != nil {
 		panic(err)
 	}
 
 	fmt.Println()
 	fmt.Println("[处理完成] 数据已保存至:", filename, renderBool(true))
 	fmt.Println("[共识别出]:")
-	fmt.Println("    [楼号数]:", len(forms), "[属性数]:", attrCount, renderBool(attrCount == len(forms)))
+	fmt.Println("    [楼号数]:", attrCount, "[A4页数]:", len(forms), renderBool(attrCount == len(forms)))
 	fmt.Println("    [门窗数]:", fmt.Sprintf("%d (%d%s)", totalWin, diffCount, "个窗户测量与标注不一致"), renderBool(diffCount == 0))
 	fmt.Println("    [总面积]:", fmt.Sprintf("%.6f (%.6f)", totalArea/1000000, totalArea))
 	fmt.Println()
