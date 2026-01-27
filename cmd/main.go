@@ -377,10 +377,14 @@ func main() {
 	fmt.Println("写入文件:", filename)
 	fmt.Println()
 
+	// 统计信息
 	var (
-		totalWin  int     // 总窗户数
-		totalArea float64 // 总窗户面积
+		attrCount int     // 属性数量，理论应该和楼号数量一致
+		diffCount int     // 测量和标注不一致的数量
+		totalWin  int     // 所有楼号总窗户数
+		totalArea float64 // 所有楼号总窗户面积
 	)
+
 	// 5. 写入表格，打印输出
 	for i, form := range forms {
 		var (
@@ -404,6 +408,9 @@ func main() {
 			)
 		}
 
+		// 统计信息
+		attrCount += len(form.scs)
+
 		for j, w := range wins {
 			// 打印信息
 			var width, height = w.Width(), w.Height()
@@ -420,6 +427,9 @@ func main() {
 			// 统计信息
 			totalWin++
 			totalArea += width * height
+			if !verifyWidth || !verifyHeight {
+				diffCount++
+			}
 
 			var (
 				valid    = renderBool(verifyWidth && verifyHeight)
@@ -459,4 +469,12 @@ func main() {
 	if err = xos.AppendFile(filename, []byte(stat), 0644); err != nil {
 		panic(err)
 	}
+
+	fmt.Println()
+	fmt.Println("[处理完成] 数据已保存至:", filename, renderBool(true))
+	fmt.Println("[共识别出]:")
+	fmt.Println("    [楼号数]:", len(forms), "[属性数]:", attrCount, renderBool(attrCount == len(forms)))
+	fmt.Println("    [门窗数]:", fmt.Sprintf("%d (%d%s)", totalWin, diffCount, "个窗户测量与标注不一致"), renderBool(diffCount == 0))
+	fmt.Println("    [总面积]:", fmt.Sprintf("%.6f (%.6f)", totalArea/1000000, totalArea))
+	fmt.Println()
 }
