@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -16,7 +20,14 @@ import (
 	"github.com/zooyer/dxf/utils"
 	"github.com/zooyer/golib/xmath"
 	"github.com/zooyer/golib/xos"
+
+	"github.com/ncruces/zenity"
+	//"github.com/sqweek/dialog" // windows系统原生GUI
+	//"github.com/progrium/darwinkit" // mac系统原生GUI
+	//"github.com/gen2brain/dlgs" // 跨平台原生GUI
 )
+
+const winTitle = "CAD数据提取"
 
 const (
 	bzGap   = 30 // 标注连接线容错(不超过则认为挨着门窗周围)，验证过: 20
@@ -178,6 +189,7 @@ func (f Form) Windows() (windows []Window) {
 	return
 }
 
+// getBox 查找当前及子结构中所有在图层中的实体组件(递归)
 func getBox(doc *dxf.Document, layer string, entity entities.Entity, parent *entities.Insert) (boxes []core.BBox) {
 	if entity == nil {
 		return
@@ -274,6 +286,7 @@ func getBZ(doc *dxf.Document, bzs []*entities.Dimension, box core.BBox, gap floa
 	return
 }
 
+// 渲染对错符号
 func renderBool(b bool) string {
 	if b {
 		return "✅"
@@ -282,6 +295,7 @@ func renderBool(b bool) string {
 	return "❌"
 }
 
+// 校验表格格式正确性，判断每行","数量是否一致
 func checkCSV(filename, header string) {
 	// 校验表格文件
 	data, err := os.ReadFile(filename)
@@ -310,24 +324,166 @@ func checkCSV(filename, header string) {
 	}
 }
 
-func init() {
-	if strings.HasPrefix(filepath.Base(os.Args[0]), "___go_build_") {
-		os.Args = append(os.Args, "cmd/testdata/洞口图纸10.dxf")
-	}
+// 统一对话框加前缀
+func guiTitle(title string) zenity.Option {
+	return zenity.Title(fmt.Sprintf("%s - %s", winTitle, title))
+}
 
-	if len(os.Args) < 2 {
-		fmt.Println("请把PDF文件拖入该程序上执行！")
-		xos.PauseExit()
-		os.Exit(1)
+// 对话框报错，则打印到日志
+func showMessage(fn func(text string, options ...zenity.Option) error, text string, options ...zenity.Option) {
+	options = append(options, zenity.Modal(), zenity.NoCancel())
+	if err := fn(text, options...); err != nil {
+		fmt.Println("[GUI错误]", err.Error())
+		var name = GetShortFuncName(fn)
+		fmt.Println(fmt.Sprintf("[%s]: %s", name, text))
 	}
 }
 
-func main() {
-	defer xos.PauseExit()
+// 计算进度百分比
+func getPercent(value, total int) int {
+	return value * 100 / total
+}
 
-	doc, err := dxf.Open(os.Args[1])
+// 设置进度条百分比
+func setPercent(dialog zenity.ProgressDialog, title string, value, total int) {
+	var percent = getPercent(value, total)
+
+	_ = dialog.Value(percent)
+	_ = dialog.Text(fmt.Sprintf("%s: %d%% (%d/%d)", title, percent, value, total))
+}
+
+// 选择文件对话框
+func selectFile() (filename string, err error) {
+	// 弹出文件选择框
+	return zenity.SelectFile(
+		guiTitle("请选择要导出的 CAD 图纸"),
+		zenity.Modal(),
+		zenity.FileFilters{
+			{"CAD图纸", []string{"*.dxf"}, false}, // dxf 文件
+			{"所有文件", []string{"*"}, false},    // 所有文件
+		},
+	)
+}
+
+// 进度条处理
+func handleProgress(title string, fn func(dialog zenity.ProgressDialog)) {
+	dialog, err := zenity.Progress(
+		guiTitle(title),
+		zenity.EntryText("正在提取 DXF 图层数据，请稍候..."),
+		zenity.Pulsate(),
+		zenity.MaxValue(100),
+		zenity.Modal(),    // 开启模态会阻塞，必须提前执行回调函数
+		zenity.NoCancel(), // 如果你不希望用户中途关闭，可以加这一行
+	)
 	if err != nil {
-		panic(err)
+		showMessage(zenity.Error, err.Error(), guiTitle("打开进度条错误"))
+		os.Exit(4)
+	}
+
+	go func() {
+		defer func() { _ = dialog.Close() }()
+
+		fn(dialog)
+
+		_ = dialog.Complete()
+	}()
+
+	<-dialog.Done()
+}
+
+// 打开文件，报错则退出
+func openFile(filename string) *dxf.Document {
+	doc, err := dxf.Open(filename)
+	if err != nil {
+		showMessage(zenity.Error, err.Error(), guiTitle("打开文件错误"))
+		os.Exit(2)
+	}
+
+	return doc
+}
+
+// 写入文件，报错则退出
+func writeFile(fn func(string, []byte, os.FileMode) error, filename string, data []byte, perm os.FileMode) {
+	if err := fn(filename, data, perm); err != nil {
+		showMessage(zenity.Error, err.Error(), guiTitle("写入文件错误"))
+		os.Exit(5)
+	}
+}
+
+// 获取输入文件: goland 测试、命令行参数、对话框选择
+func getInput() string {
+	// IDE 运行测试
+	if strings.HasPrefix(filepath.Base(os.Args[0]), "___go_build_") {
+		return "cmd/testdata/洞口图纸10.dxf"
+	}
+
+	// 入参传入文件名
+	if len(os.Args) > 1 {
+		return os.Args[1]
+	}
+
+	// 选择文件
+	filename, err := selectFile()
+	if err != nil {
+		if errors.Is(err, zenity.ErrCanceled) {
+			showMessage(zenity.Warning, "取消选择文件，即将退出程序！", guiTitle("选择文件提示"))
+		} else {
+			showMessage(zenity.Error, err.Error(), guiTitle("选择文件错误"))
+		}
+
+		os.Exit(1)
+	}
+
+	return filename
+}
+
+// 获取输出文件: 默认路径、自定义路径
+func getOutput(input string) string {
+	// 默认保存文件名
+	var defaultOutput = strings.TrimSuffix(input, filepath.Ext(input)) + ".csv"
+
+	if err := zenity.Question(
+		fmt.Sprintf("保存到默认路径？\n默认路径: %s", defaultOutput),
+		guiTitle("保存表格文件"),
+		zenity.Modal(),
+		zenity.NoCancel(),
+		zenity.OKLabel("默认路径"),
+		zenity.CancelLabel("自定义位置"),
+	); err != nil {
+		// 取消就是自定义位置
+		if errors.Is(err, zenity.ErrCanceled) {
+			var output string
+			if output, err = zenity.SelectFileSave(
+				guiTitle("保存到"),
+				zenity.Modal(),
+				zenity.Filename(defaultOutput), // 默认文件名
+				zenity.FileFilters{
+					{"表格 CSV", []string{"*.csv"}, false}, // 限制文件类型
+				},
+			); err == nil {
+				if !strings.HasSuffix(output, ".csv") {
+					output += ".csv"
+				}
+
+				return output
+			}
+
+			if errors.Is(err, zenity.ErrCanceled) {
+				os.Exit(3)
+			}
+		}
+
+		var text = fmt.Sprintf("将使用默认路径：%s\n错误信息：%s", defaultOutput, err.Error())
+		showMessage(zenity.Error, text, guiTitle("保存文件错误"))
+	}
+
+	return defaultOutput
+}
+
+// 提取门窗确认单
+func getForms(dialog zenity.ProgressDialog, doc *dxf.Document) []Form {
+	if dialog == nil || doc == nil {
+		return nil
 	}
 
 	var (
@@ -339,7 +495,11 @@ func main() {
 
 	// 1. 提取所有组件、信息
 	// 确认单A4(名称TKA4)、楼号信息(名称SC)、楼号门窗(图层PJ)、门窗标注(图层BZ)
-	for _, entity := range doc.Entities {
+	fmt.Printf("[开始处理]: %d 个实体组件...\n", len(doc.Entities))
+	for i, entity := range doc.Entities {
+		setPercent(dialog, "解析文档", i+1, len(doc.Entities))
+		//time.Sleep(1 * time.Millisecond)
+
 		switch e := entity.(type) {
 		case *entities.Insert:
 			switch e.BlockName {
@@ -360,11 +520,13 @@ func main() {
 		return a4s[i].InsertionPoint.X < a4s[j].InsertionPoint.X
 	})
 
-	fmt.Printf("开始处理: %d 个门窗数据...\n", len(a4s))
-
 	// 3. 计算包含、相邻关系，划分组件、信息归属
 	var forms = make([]Form, 0, len(a4s))
-	for _, a4 := range a4s {
+	fmt.Printf("[开始处理]: %d 个门窗数据...\n", len(a4s))
+	for i, a4 := range a4s {
+		setPercent(dialog, "计算组件", i+1, len(a4s))
+		//time.Sleep(100 * time.Millisecond)
+
 		var (
 			box   = utils.GetEntityBBoxWCS(doc, a4)
 			attrs []*entities.Insert
@@ -396,17 +558,24 @@ func main() {
 		})
 	}
 
-	// 4. 写入表头
+	return forms
+}
+
+// 保存表格文件
+func saveFile(dialog zenity.ProgressDialog, input, output string, forms []Form) {
+	// 写入表头
 	const (
 		header    = "序号,楼号,宽度,高度,校验,测量宽度,测量高度,识别宽度,识别高度\n"
 		emptyLine = ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,"
 	)
-	var filename = strings.TrimSuffix(os.Args[1], filepath.Ext(os.Args[1])) + ".csv"
-	_ = os.WriteFile(filename, []byte(header), 0644)
-	fmt.Println("写入文件:", filename)
+
+	writeFile(os.WriteFile, output, []byte(header), 0644)
+
+	fmt.Println("写入文件:", output)
 	fmt.Println()
+
 	// 最后校验文件格式
-	defer checkCSV(filename, header)
+	defer checkCSV(output, header)
 
 	// 统计信息
 	var (
@@ -416,8 +585,10 @@ func main() {
 		totalArea float64 // 所有楼号总窗户面积
 	)
 
-	// 5. 写入表格，打印输出
+	// 写入表格，打印输出
 	for i, form := range forms {
+		setPercent(dialog, "写入文件", i+1, len(forms))
+
 		var (
 			box  = form.BBox()
 			wins = form.Windows()
@@ -478,34 +649,97 @@ func main() {
 				fmt.Sprint(w.Widths), fmt.Sprint(w.Heights),
 			)
 
-			if err = xos.AppendFile(filename, []byte(line), 0644); err != nil {
-				panic(err)
-			}
+			writeFile(xos.AppendFile, output, []byte(line), 0644)
 		}
 
 		// 填充空行，至少7行
 		for j := len(wins); j < 7; j++ {
 			var line = emptyLine[:strings.Count(header, ",")] + "\n"
 
-			if err = xos.AppendFile(filename, []byte(line), 0644); err != nil {
-				panic(err)
-			}
+			writeFile(xos.AppendFile, output, []byte(line), 0644)
 		}
 	}
 
 	// 写入统计信息
 	var buf bytes.Buffer
 	buf.WriteString("统计信息,总楼号数,总门窗数,总面积,A4页数,误差数,文件名,,\n")
-	buf.WriteString(fmt.Sprintf(",%d,%d,%.6f,%d,%d,%s,,\n", attrCount, totalWin, totalArea/1000000, len(forms), diffCount, filepath.Base(os.Args[1])))
-	if err = xos.AppendFile(filename, buf.Bytes(), 0644); err != nil {
-		panic(err)
-	}
+	buf.WriteString(fmt.Sprintf(",%d,%d,%.6f,%d,%d,%s,,\n", attrCount, totalWin, totalArea/1000000, len(forms), diffCount, filepath.Base(input)))
+	writeFile(xos.AppendFile, output, buf.Bytes(), 0644)
 
 	fmt.Println()
-	fmt.Println("[处理完成] 数据已保存至:", filename, renderBool(true))
+	fmt.Println("[处理完成] 数据已保存至:", output, renderBool(true))
 	fmt.Println("[共识别出]:")
 	fmt.Println("    [楼号数]:", attrCount, "[A4页数]:", len(forms), renderBool(attrCount == len(forms)))
 	fmt.Println("    [门窗数]:", fmt.Sprintf("%d (%d%s)", totalWin, diffCount, "个窗户测量与标注不一致"), renderBool(diffCount == 0))
 	fmt.Println("    [总面积]:", fmt.Sprintf("%.6f (%.6f)", totalArea/1000000, totalArea))
 	fmt.Println()
+}
+
+// GetFunctionName 获取函数全程，含路径
+func GetFunctionName(fn any) string {
+	// 获取函数的指针地址
+	var pc = reflect.ValueOf(fn).Pointer()
+
+	// 查找函数信息
+	return runtime.FuncForPC(pc).Name()
+}
+
+// GetShortFuncName 只返回 "包名.函数名"
+func GetShortFuncName(fn any) string {
+	var fullPath = GetFunctionName(fn)
+
+	// 找到最后一个斜杠的位置
+	lastSlash := strings.LastIndex(fullPath, "/")
+	if lastSlash == -1 {
+		return fullPath // 如果没有斜杠，说明已经是 "包名.函数名" 格式
+	}
+
+	// 截取斜杠之后的部分
+	return fullPath[lastSlash+1:]
+}
+
+// RevealFile 打开资源管理器，并选中该文件
+func RevealFile(filename string) error {
+	var cmd *exec.Cmd
+
+	switch runtime.GOOS {
+	case "windows":
+		// Windows: 使用 explorer /select,
+		cmd = exec.Command("explorer", "/select,", filename)
+	case "darwin":
+		// macOS: 使用 open -R
+		cmd = exec.Command("open", "-R", filename)
+	default:
+		// Linux: 通常使用 dbus 发送信号，或者简单打开文件夹
+		// 这里简单演示打开文件夹
+		// cmd = exec.Command("xdg-open", filepath.Dir(filePath))
+		return nil
+	}
+
+	return cmd.Run()
+}
+
+func main() {
+	var (
+		forms    []Form
+		input    = getInput()      // 获取输入文件
+		document = openFile(input) // 打开输入文件
+	)
+
+	// 提取数据
+	handleProgress("提取数据", func(dialog zenity.ProgressDialog) {
+		forms = getForms(dialog, document)
+	})
+
+	// 获取输出文件
+	var output = getOutput(input)
+
+	// 保存文件
+	handleProgress("保存文件", func(dialog zenity.ProgressDialog) {
+		saveFile(dialog, input, output, forms)
+	})
+
+	showMessage(zenity.Info, "数据导出成功！", guiTitle("导出提示"))
+
+	_ = RevealFile(output)
 }
