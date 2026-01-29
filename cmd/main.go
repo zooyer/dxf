@@ -359,8 +359,8 @@ func selectFile() (filename string, err error) {
 		guiTitle("请选择要导出的 CAD 图纸"),
 		zenity.Modal(),
 		zenity.FileFilters{
-			{"CAD图纸", []string{"*.dxf"}, false}, // dxf 文件
-			{"所有文件", []string{"*"}, false},    // 所有文件
+			{"CAD图纸", []string{"*.dxf"}, false},
+			{"所有文件", []string{"*"}, false},
 		},
 	)
 }
