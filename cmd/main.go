@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	_ "embed"
 	"errors"
 	"fmt"
 	"math"
@@ -12,6 +13,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/zooyer/dxf"
@@ -21,7 +23,8 @@ import (
 	"github.com/zooyer/golib/xmath"
 	"github.com/zooyer/golib/xos"
 
-	"github.com/ncruces/zenity"
+	"github.com/ncruces/zenity" // 原生对话框
+	"github.com/xuri/excelize/v2"
 	//"github.com/sqweek/dialog" // windows系统原生GUI
 	//"github.com/progrium/darwinkit" // mac系统原生GUI
 	//"github.com/gen2brain/dlgs" // 跨平台原生GUI
@@ -42,6 +45,9 @@ type Window struct {
 	Widths  []float64             // 标注宽度
 	Heights []float64             // 标注高度
 }
+
+//go:embed template.xlsx
+var template []byte
 
 func (w Window) Width() float64 {
 	return w.Box.Max.X - w.Box.Min.X
@@ -440,7 +446,7 @@ func getInput() string {
 // 获取输出文件: 默认路径、自定义路径
 func getOutput(input string) string {
 	// 默认保存文件名
-	var defaultOutput = strings.TrimSuffix(input, filepath.Ext(input)) + ".csv"
+	var defaultOutput = strings.TrimSuffix(input, filepath.Ext(input)) + ".xlsx"
 
 	if err := zenity.Question(
 		fmt.Sprintf("保存到默认路径？\n默认路径: %s", defaultOutput),
@@ -458,11 +464,11 @@ func getOutput(input string) string {
 				zenity.Modal(),
 				zenity.Filename(defaultOutput), // 默认文件名
 				zenity.FileFilters{
-					{"表格 CSV", []string{"*.csv"}, false}, // 限制文件类型
+					{"表格/Excel", []string{"*.xlsx"}, false}, // 限制文件类型
 				},
 			); err == nil {
-				if !strings.HasSuffix(output, ".csv") {
-					output += ".csv"
+				if !strings.HasSuffix(output, ".xlsx") {
+					output += ".xlsx"
 				}
 
 				return output
@@ -562,7 +568,7 @@ func getForms(dialog zenity.ProgressDialog, doc *dxf.Document) []Form {
 }
 
 // 保存表格文件
-func saveFile(dialog zenity.ProgressDialog, input, output string, forms []Form) {
+func saveCSV(dialog zenity.ProgressDialog, input, output string, forms []Form) {
 	// 写入表头
 	const (
 		header    = "序号,楼号,宽度,高度,校验,测量宽度,测量高度,识别宽度,识别高度\n"
@@ -675,6 +681,156 @@ func saveFile(dialog zenity.ProgressDialog, input, output string, forms []Form) 
 	fmt.Println()
 }
 
+const sheet = "Sheet1"
+
+func checkError(err error, title string) {
+	if err != nil {
+		showMessage(zenity.Error, err.Error(), guiTitle(title))
+		os.Exit(5)
+	}
+}
+
+func setExcelValue(excel *excelize.File, cell string, value any) {
+	checkError(excel.SetCellValue(sheet, cell, value), "写入数据错误")
+}
+
+type Style struct {
+	Yellow int // 面积小计行
+	Border int // 所有数据边框
+	Height int // 高度列红色
+	Total  int // 合计样式
+}
+
+func getStyles(excel *excelize.File) Style {
+	var (
+		font = excelize.Font{
+			Size: 12,
+		}
+		aligns = excelize.Alignment{
+			Horizontal: "center",
+			Vertical:   "center",
+		}
+		borders = []excelize.Border{
+			{Type: "left", Color: "000000", Style: 1},
+			{Type: "right", Color: "000000", Style: 1},
+			{Type: "top", Color: "000000", Style: 1},
+			{Type: "bottom", Color: "000000", Style: 1},
+		}
+	)
+
+	yellow, err := excel.NewStyle(&excelize.Style{
+		Border: borders,
+		Font:   &font,
+		Fill: excelize.Fill{
+			Type:    "pattern",
+			Color:   []string{"#FFFF00"}, // 黄色背景
+			Pattern: 1,                   // 必须填 1（Solid）
+		},
+		Alignment: &excelize.Alignment{
+			Vertical: "center",
+		},
+	})
+	checkError(err, "创建黄色背景样式错误")
+
+	border, err := excel.NewStyle(&excelize.Style{
+		Font:      &font,
+		Border:    borders,
+		Alignment: &aligns,
+	})
+	checkError(err, "创建边框样式错误")
+
+	height, err := excel.NewStyle(&excelize.Style{
+		Font: &excelize.Font{
+			Size:  font.Size,
+			Color: "FF0000",
+		},
+		Border:    borders,
+		Alignment: &aligns,
+	})
+	checkError(err, "创建高度列样式错误")
+
+	total, err := excel.NewStyle(&excelize.Style{
+		Font:      &font,
+		Alignment: &aligns,
+	})
+	checkError(err, "创建合计样式错误")
+
+	return Style{
+		Yellow: yellow,
+		Border: border,
+		Height: height,
+		Total:  total,
+	}
+}
+
+func saveExcel(dialog zenity.ProgressDialog, input, output string, forms []Form) {
+	excel, err := excelize.OpenReader(bytes.NewReader(template))
+	checkError(err, "打开表格模板错误")
+
+	defer func() {
+		checkError(excel.UpdateLinkedValue(), "清除缓存")
+		checkError(excel.SaveAs(output), "写入文件错误")
+		checkError(excel.Close(), "写入文件错误")
+	}()
+
+	var styles = getStyles(excel)
+
+	for i, form := range forms {
+		setPercent(dialog, "写入文件", i+1, len(forms))
+
+		var wins = form.Windows()
+
+		for j, w := range append(wins, make([]Window, 6-len(wins))...) {
+			var (
+				line     = (i * 7) + j + 2
+				cell     = strconv.Itoa(line)
+				area     = fmt.Sprintf("=C%s*D%s/1000000*E%s", cell, cell, cell)
+				serial   string
+				building string
+			)
+
+			if j == 0 {
+				checkError(excel.MergeCell(sheet, "A"+cell, fmt.Sprintf("A%d", line+5)), "合并单元格错误")
+				checkError(excel.MergeCell(sheet, "B"+cell, fmt.Sprintf("B%d", line+5)), "合并单元格错误")
+				serial, building = form.Serial(), form.Building()
+				setExcelValue(excel, "A"+cell, serial)   // 序号
+				setExcelValue(excel, "B"+cell, building) // 楼号
+			}
+
+			// 有效门窗
+			if len(w.Widths) > 0 {
+				setExcelValue(excel, "C"+cell, w.MaxWidth())
+				setExcelValue(excel, "D"+cell, w.MaxHeight())
+				setExcelValue(excel, "E"+cell, 1)
+			}
+
+			checkError(excel.SetCellFormula(sheet, "F"+cell, area), "写入面积公式错误")
+		}
+
+		var (
+			line    = i*7 + 2
+			formula = fmt.Sprintf("SUM(F%d:F%d)", line, line+5)
+		)
+
+		// 小计、样式
+		checkError(excel.SetCellFormula(sheet, "F"+strconv.Itoa(line+6), formula), "写入小计错误")
+		checkError(excel.SetCellStyle(sheet, "A"+strconv.Itoa(line), "F"+strconv.Itoa(line+6), styles.Border), "设置边框错误")
+		checkError(excel.SetCellStyle(sheet, "A"+strconv.Itoa(line+6), "F"+strconv.Itoa(line+6), styles.Yellow), "设置背景颜色错误")
+		checkError(excel.SetCellStyle(sheet, "D"+strconv.Itoa(line), "D"+strconv.Itoa(line+5), styles.Height), "设置高度列样式错误")
+	}
+
+	// 合计
+	var line = len(forms)*7 + 3
+	setExcelValue(excel, "A"+strconv.Itoa(line), "合计")
+	checkError(excel.MergeCell(sheet, "A"+strconv.Itoa(line), "E"+strconv.Itoa(line)), "合并单元格错误")
+	var cells = make([]string, 0, len(forms))
+	for i := range forms {
+		cells = append(cells, fmt.Sprintf("F%d", i*7+2+6))
+	}
+	checkError(excel.SetCellFormula(sheet, "F"+strconv.Itoa(line), strings.Join(cells, "+")), "写入合计错误")
+	checkError(excel.SetCellStyle(sheet, "F"+strconv.Itoa(line), "F"+strconv.Itoa(line), styles.Total), "设置合计样式错误")
+}
+
 // GetFunctionName 获取函数全程，含路径
 func GetFunctionName(fn any) string {
 	// 获取函数的指针地址
@@ -736,7 +892,7 @@ func main() {
 
 	// 保存文件
 	handleProgress("保存文件", func(dialog zenity.ProgressDialog) {
-		saveFile(dialog, input, output, forms)
+		saveExcel(dialog, input, output, forms)
 	})
 
 	showMessage(zenity.Info, "数据导出成功！", guiTitle("导出提示"))
