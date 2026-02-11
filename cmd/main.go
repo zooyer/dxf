@@ -216,7 +216,7 @@ func getBox(doc *dxf.Document, layer string, entity entities.Entity, parent *ent
 	}
 
 	block, exists := doc.Blocks[insert.BlockName]
-	if !exists {
+	if !exists || block == nil {
 		return
 	}
 
@@ -289,6 +289,7 @@ func getBZ(doc *dxf.Document, bzs []*entities.Dimension, box core.BBox, gap floa
 			rest = append(rest, bz)
 		}
 	}
+
 	return
 }
 
