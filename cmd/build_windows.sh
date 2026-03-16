@@ -1,6 +1,6 @@
 #!/bin/bash
 
-name="导出dxf门窗尺寸v1.0.2.exe"
+name="导出dxf门窗尺寸v1.0.3.exe"
 
 echo "Building..."
 
