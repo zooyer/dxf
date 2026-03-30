@@ -25,7 +25,7 @@ func (t Tag) AsInt() int {
 
 // AsString 清洗字符串（去除多余空格）
 func (t Tag) AsString() string {
-	return strings.TrimSpace(t.Value)
+	return strings.TrimSpace(GetString(t.Value))
 }
 
 // Point 代表三维空间中的一个点
