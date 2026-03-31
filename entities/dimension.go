@@ -73,7 +73,7 @@ func (d *Dimension) Parse(scanner *core.Scanner) error {
 
 // BBox 覆盖：为了通用库的严谨性，标注的 BBox 应该包含所有定义点
 func (d *Dimension) BBox() core.BBox {
-	return d.BBox2(0)
+	return d.BBox2(0, 0)
 }
 
 // GetExtensionPoints 计算标注线上的两个转角点
@@ -113,7 +113,7 @@ func (d *Dimension) GetExtensionPoints() (p13Corner, p14Corner core.Point) {
 
 // BBox2 实现“完美矩形”包围盒
 // exe 代表标注线超出延伸线的长度 (DIMEXE)
-func (d *Dimension) BBox2(exe float64) core.BBox {
+func (d *Dimension) BBox2(exe, exo float64) core.BBox {
 	// 1. 获取基础的转角投影点 (标注线上的两个端点)
 	c13, c14 := d.GetExtensionPoints()
 
@@ -128,29 +128,20 @@ func (d *Dimension) BBox2(exe float64) core.BBox {
 	// 我们通过向量 (c13 - MeasureStart) 与 u 的点积来判定方向
 	vecToLine := core.Point{X: c13.X - d.MeasureStart.X, Y: c13.Y - d.MeasureStart.Y}
 	dot := vecToLine.X*u.X + vecToLine.Y*u.Y
-
-	direction := 1.0
+	dir := 1.0
 	if dot < 0 {
-		direction = -1.0
+		dir = -1.0
 	}
 
-	p13Top := core.Point{
-		X: c13.X + u.X*exe*direction,
-		Y: c13.Y + u.Y*exe*direction,
-	}
-	p14Top := core.Point{
-		X: c14.X + u.X*exe*direction,
-		Y: c14.Y + u.Y*exe*direction,
-	}
+	p13Top := core.Point{X: c13.X + u.X*exe*dir, Y: c13.Y + u.Y*exe*dir}
+	p14Top := core.Point{X: c14.X + u.X*exe*dir, Y: c14.Y + u.Y*exe*dir}
+
+	// 向下推，确保包住 13/14 点甚至更远一点点
+	p13Bot := core.Point{X: d.MeasureStart.X - u.X*exo*dir, Y: d.MeasureStart.Y - u.Y*exo*dir}
+	p14Bot := core.Point{X: d.MeasureEnd.X - u.X*exo*dir, Y: d.MeasureEnd.Y - u.Y*exo*dir}
 
 	// 4. 收集 4 个关键顶点：2个测量原点 + 2个冒尖的顶点
-	points := []core.Point{
-		d.MeasureStart,
-		d.MeasureEnd,
-		p13Top,
-		p14Top,
-		d.TextMidPoint, // 文字位置
-	}
+	points := []core.Point{p13Top, p14Top, p13Bot, p14Bot, d.TextMidPoint}
 
 	// 5. 计算包围盒
 	minX, minY := math.MaxFloat64, math.MaxFloat64

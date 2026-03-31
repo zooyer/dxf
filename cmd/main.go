@@ -36,6 +36,10 @@ const (
 	bzGap   = 30 // 标注连接线容错(不超过则认为挨着门窗周围)，验证过: 20
 	winGap  = 20 // 窗户连接线容错(不超过则认为是同一个窗户)，验证过: 10
 	epsilon = 1  // 浮点数对比精度误差(误差不超过则认为相同)，验证过: 1
+
+	// 中心扩展搜索缩放
+	widthFactor  = 0.06
+	heightFactor = 0.2
 )
 
 type Window struct {
@@ -142,7 +146,7 @@ func (f Form) Windows() (windows []Window) {
 		return boxes[i].Min.X < boxes[j].Min.X
 	})
 
-	for _, box := range boxes {
+	for i, box := range boxes {
 		var (
 			area  = box                 // 扩展范围
 			alls  = f.bzs               // 所有标注
@@ -150,14 +154,12 @@ func (f Form) Windows() (windows []Window) {
 			nears []*entities.Dimension // 附近标注
 		)
 
+		fmt.Println(fmt.Sprintf("窗户%d:", i+1))
+
 		for {
-			if alls, curr, area = getBZ(f.doc, alls, area, bzGap); len(curr) == 0 {
+			if alls, curr, area = getBZ3(f.doc, alls, area, widthFactor, heightFactor); len(curr) == 0 {
 				break
 			}
-
-			// 打印每次扩展范围
-			// TODO debug
-			//fmt.Printf("RECTANG %f,%f %f,%f\n", wr.Min.X, wr.Min.Y, wr.Max.X, wr.Max.Y)
 
 			nears = append(nears, curr...)
 		}
@@ -245,30 +247,36 @@ func getBZ(doc *dxf.Document, bzs []*entities.Dimension, box core.BBox, gap floa
 			continue
 		}
 
-		var exe = 0.0
+		var (
+			exe   = 0.0
+			exo   = 0.0
+			scale = 1.0
+		)
 
 		if style, ok := doc.DimStyles[bz.StyleName]; ok {
-			exe = style.ExLimit * style.Scale
+			scale = style.Scale
+			exe = style.ExLimit * scale
+			exo = style.ExOffset * scale
 		}
+
+		var bzRect = bz.BBox2(exe, exo)
 
 		// 1. 精度判定：检查被测量的两个端点 (13 和 14) 是否挨着窗户
 		// 使用很小的 gap (比如 10-50) 就能精准匹配
-		startIn := !utils.IsSeparate(box, bz.BBox2(exe), gap)
-		endIn := !utils.IsSeparate(box, bz.BBox2(exe), gap)
+		startIn := !utils.IsSeparate(box, bzRect, gap*scale)
+		endIn := !utils.IsSeparate(box, bzRect, gap*scale)
 
 		if startIn || endIn {
 			// 匹配成功
 			near = append(near, bz)
 
-			b := bz.BBox2(exe)
-
 			// 打印标注范围
 			// TODO debug
-			//fmt.Printf("BZ [%.0f] RECTANG %f,%f %f,%f\n", GetBZValue(doc, bz), b.Min.X, b.Min.Y, b.Max.X, b.Max.Y)
+			fmt.Printf("BZ RECTANG %f,%f %f,%f\n", bzRect.Min.X, bzRect.Min.Y, bzRect.Max.X, bzRect.Max.Y)
 
 			// 2. 盒子扩充：按照最远的点（10, 11, 13, 14）补全成最大矩形
 			// 这样下一轮迭代就能通过“标注线”抓到更外圈的“总尺寸”标注
-			points := []core.Point{b.Min, b.Max}
+			points := []core.Point{bzRect.Min, bzRect.Max}
 			//points := []core.Point{bz.TextMidPoint, bz.DefPoint, bz.MeasureStart, bz.MeasureEnd}
 			for _, p := range points {
 				if p.X < newBox.Min.X {
@@ -288,6 +296,164 @@ func getBZ(doc *dxf.Document, bzs []*entities.Dimension, box core.BBox, gap floa
 			// 没匹配上的放回池子
 			rest = append(rest, bz)
 		}
+	}
+
+	return
+}
+
+// getBZ 寻找与当前 box 邻近的标注
+// 增加动态容错逻辑：根据当前 box 的尺寸自动计算 gap
+func getBZ2(doc *dxf.Document, bzs []*entities.Dimension, box core.BBox, factor float64) (rest, near []*entities.Dimension, newBox core.BBox) {
+	newBox = box // 初始继承旧盒子
+
+	// --- 动态 Gap 计算 ---
+	// 计算当前盒子的尺寸（比如窗户的宽或高）
+	width := box.Max.X - box.Min.X
+	height := box.Max.Y - box.Min.Y
+	// 取长边作为基准，计算动态容差
+	// 建议 factor 传入 0.1 到 0.2 (即 10%-20%)
+	dynamicGap := math.Max(width, height) * factor
+
+	// 设置一个合理的最小值，防止在极小物体上失效
+	if dynamicGap < 50 {
+		dynamicGap = 50
+	}
+	// --- 动态 Gap 结束 ---
+
+	for _, bz := range bzs {
+		// 只要转角标注
+		if bz.DimType != 0 {
+			rest = append(rest, bz)
+			continue
+		}
+
+		var (
+			exe   = 0.0
+			exo   = 0.0
+			scale = 1.0
+		)
+
+		if style, ok := doc.DimStyles[bz.StyleName]; ok {
+			scale = style.Scale
+			exe = style.ExLimit * scale
+			exo = style.ExOffset * scale
+		}
+
+		// 获取完美矩形（已包含冒尖和脚底空隙）
+		var bzRect = bz.BBox2(exe, exo)
+
+		// 判定：使用动态计算出来的 dynamicGap
+		// 这里不再需要乘以 scale，因为 dynamicGap 是基于物理坐标 box 算出来的
+		isNear := !utils.IsSeparate(box, bzRect, dynamicGap)
+
+		if isNear {
+			// 匹配成功
+			near = append(near, bz)
+
+			// 扩充盒子：将标注的范围完全吃进 newBox
+			// 这样下一轮循环，newBox 就会变成包含这个标注的大盒子，去够更远的外圈标注
+			if bzRect.Min.X < newBox.Min.X {
+				newBox.Min.X = bzRect.Min.X
+			}
+			if bzRect.Min.Y < newBox.Min.Y {
+				newBox.Min.Y = bzRect.Min.Y
+			}
+			if bzRect.Max.X > newBox.Max.X {
+				newBox.Max.X = bzRect.Max.X
+			}
+			if bzRect.Max.Y > newBox.Max.Y {
+				newBox.Max.Y = bzRect.Max.Y
+			}
+
+			fmt.Println("")
+		} else {
+			rest = append(rest, bz)
+		}
+	}
+
+	return
+}
+
+func printBox(prefix, name string, box core.BBox) {
+	width := box.Max.X - box.Min.X
+	height := box.Max.Y - box.Min.Y
+
+	fmt.Printf("%s[%s] | %.1f x %.1f | RECTANG %.2f,%.2f %.2f,%.2f\n",
+		prefix, name, width, height, box.Min.X, box.Min.Y, box.Max.X, box.Max.Y,
+	)
+}
+
+func getBZ3(doc *dxf.Document, bzs []*entities.Dimension, box core.BBox, factorX, factorY float64) (rest, near []*entities.Dimension, newBox core.BBox) {
+	newBox = box
+
+	// --- 1. 计算独立的动态探测盒子 ---
+	width := box.Max.X - box.Min.X
+	height := box.Max.Y - box.Min.Y
+
+	// 长度和宽度分开计算百分比，并平均分配到两端
+	offsetX := (width * factorX) / 2.0
+	offsetY := (height * factorY) / 2.0
+
+	// 设置一个基础保底值（比如 50 单位），防止长或宽为 0 时失效
+	if offsetX < 50 {
+		offsetX = 50
+	}
+	if offsetY < 50 {
+		offsetY = 50
+	}
+
+	searchBox := core.BBox{
+		Min: core.Point{X: box.Min.X - offsetX, Y: box.Min.Y - offsetY},
+		Max: core.Point{X: box.Max.X + offsetX, Y: box.Max.Y + offsetY},
+	}
+	// -----------------------------
+
+	printBox("    ", "搜索盒子", searchBox)
+	for _, bz := range bzs {
+		if bz.DimType != 0 {
+			rest = append(rest, bz)
+			continue
+		}
+
+		var (
+			exe   = 0.0
+			exo   = 0.0
+			scale = 1.0
+		)
+		if style, ok := doc.DimStyles[bz.StyleName]; ok {
+			scale = style.Scale
+			exe = style.ExLimit * scale
+			exo = style.ExOffset * scale
+		}
+
+		// 获取标注的完美矩形 (包含冒尖和脚底偏移)
+		bzRect := bz.BBox2(exe, exo)
+
+		// 2. 判定：探测盒与标注矩形是否重叠
+		// 此时 gap 传 0，因为容错已经完全由 searchBox 承担
+		if utils.IsSeparate(searchBox, bzRect, 0) {
+			rest = append(rest, bz)
+			continue
+		}
+
+		near = append(near, bz)
+
+		// 3. 扩充最终的 newBox
+		if bzRect.Min.X < newBox.Min.X {
+			newBox.Min.X = bzRect.Min.X
+		}
+		if bzRect.Min.Y < newBox.Min.Y {
+			newBox.Min.Y = bzRect.Min.Y
+		}
+		if bzRect.Max.X > newBox.Max.X {
+			newBox.Max.X = bzRect.Max.X
+		}
+		if bzRect.Max.Y > newBox.Max.Y {
+			newBox.Max.Y = bzRect.Max.Y
+		}
+
+		// 打印每次扩展范围
+		printBox("      ", "标注扩展", newBox)
 	}
 
 	return
@@ -779,6 +945,7 @@ func saveExcel(dialog zenity.ProgressDialog, input, output string, forms []Form)
 	for i, form := range forms {
 		setPercent(dialog, "写入文件", i+1, len(forms))
 
+		fmt.Println("序号:", form.Serial())
 		var wins = form.Windows()
 
 		for j, w := range append(wins, make([]Window, 6-len(wins))...) {

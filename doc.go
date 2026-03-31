@@ -11,9 +11,10 @@ import (
 
 type DimStyle struct {
 	Name      string
-	Precision int     // 对应组码 271 DIMDEC，显示的小数位数
-	ExLimit   float64 // 对应组码 44 DIMEXE，标注线超出延伸线的长度
-	Scale     float64 // 对应组码 40 DIMSCALE，全局比例，影响所有标注特征)
+	Precision int     // 271: DIMDEC（显示的小数位数）
+	ExLimit   float64 // 44:  DIMEXE (冒尖长度，标注线超出延伸线的长度)
+	ExOffset  float64 // 42:  DIMEXO (起点偏移量，即延伸线离测量点的空隙)
+	Scale     float64 // 40:  DIMSCALE (全局比例，影响所有标注特征)
 }
 
 type Block struct {
@@ -105,6 +106,7 @@ func (d *Document) parseDimStyles(scanner *core.Scanner) {
 			currentStyle = &DimStyle{
 				Precision: 0,
 				ExLimit:   0.0,
+				ExOffset:  0.0,
 				Scale:     1.0, // 默认为 1.0，防止乘法归零
 			}
 
@@ -120,6 +122,8 @@ func (d *Document) parseDimStyles(scanner *core.Scanner) {
 					currentStyle.Precision = t.AsInt()
 				case 44: // 标注线超出延伸线长度 (DIMEXE)
 					currentStyle.ExLimit = t.AsFloat()
+				case 42: // 起点偏移量，即延伸线离测量点的空隙 (DIMEXO)
+					currentStyle.ExOffset = t.AsFloat()
 				case 40: // 全局标注比例 (DIMSCALE)
 					currentStyle.Scale = t.AsFloat()
 				}
